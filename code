@@ -1,0 +1,83 @@
+import os
+import pandas as pd
+import requests
+import json
+from google.cloud import bigquery
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+NYT_API_KEY = os.getenv("NYT_API_KEY")
+PROJECT_ID = os.getenv("GCP_PROJECT_ID")
+
+def load_csv():
+    url = f"https://api.nytimes.com/svc/books/v3/lists/overview.json?api-key={NYT_API_KEY}"
+    response = requests.get(url)
+    data = response.json()
+    main_data_list = data["results"]["lists"]
+    
+    df = pd.json_normalize(
+        data=main_data_list,
+        record_path=['books'],
+        meta=['list_name', 'display_name', 'list_name_encoded', 'updated', 'list_image'],
+        errors='ignore',
+        sep='_'
+    )
+    
+    df.drop([
+        'list_image', 'isbns', 'first_chapter_link', 'amazon_product_url', 
+        'buy_links', 'age_group', 'asterisk', 'dagger', 'primary_isbn13', 
+        'display_name', 'list_name_encoded'
+    ], axis=1, inplace=True, errors='ignore')
+    
+    df.to_csv('book3.csv', index=False)
+  
+def load_bigquery():
+    client = bigquery.Client()
+    table_ref = f"{PROJECT_ID}.raw_data.book3"
+    job_config = bigquery.LoadJobConfig(
+        autodetect=True,
+        source_format=bigquery.SourceFormat.CSV,
+        skip_leading_rows=1 
+    )
+    with open('book3.csv', 'rb') as source_file:
+        job = client.load_table_from_file(source_file, table_ref, job_config=job_config)
+        job.result()
+        print("Upload complete!")
+
+def tranform_csv():
+    client = bigquery.Client()
+    QUERY = f""" 
+    CREATE OR REPLACE TABLE `{PROJECT_ID}.raw_data.cleaned_books` AS
+    WITH cleaned_list AS (
+        SELECT 
+            title,
+            description,
+            author,
+            TRIM(REPLACE(contributor, 'by', '')) AS contributor,
+            rank,
+            rank_last_week,
+            CASE 
+                WHEN rank_last_week = 0 THEN "New Rank"
+                WHEN rank_last_week > rank THEN CONCAT('+', rank_last_week - rank)
+                ELSE CAST(rank_last_week - rank AS STRING)
+            END AS change_in_ranking,
+            weeks_on_list,
+            updated,
+            FORMAT_DATE('%d/%m/%Y', created_date) AS created_date,
+            publisher,
+            list_name,
+            FORMAT_DATE('%d/%m/%Y', updated_date) AS udpated_date
+        FROM 
+            `{PROJECT_ID}.raw_data.book3`
+        ORDER BY rank
+    )
+    SELECT * FROM cleaned_list;
+    """
+    query_job = client.query(QUERY)
+    query_job.result()
+    print('Transformation complete!')
+
+if __name__ == "__main__":
+    tranform_csv()
